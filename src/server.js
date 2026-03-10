@@ -1,6 +1,10 @@
+require("dotenv").config();
 const express = require("express");
 const db = require("./db");
-const { interpretar } = require("./interpretarMensagem");
+const { interpretarMensagem } = require("./geminiService");
+const { executarAcao } = require("./acoesGemini");
+const { formatarResposta } = require("./formatarResposta");
+const { enviarMensagem } = require("./whatsapp");
 
 const app = express();
 app.use(express.json());
@@ -144,9 +148,65 @@ app.delete("/despesas/:id", (req, res) => {
   }
 });
 
-// ---------------------- PROCESSAMENTO (WEBHOOK) ----------------------
-// Recebe mensagem + nr_telefone, interpreta, executa ação e retorna resultado
-app.post("/processar", (req, res) => {
+// ---------------------- WEBHOOK WHATSAPP ----------------------
+const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "despesas-verify-token";
+
+// Resposta rápida para o Meta validar (evita timeouts)
+app.get("/webhook/whatsapp", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === WHATSAPP_VERIFY_TOKEN) {
+    res.type("text/plain").status(200).send(challenge);
+  } else {
+    res.status(403).send("Forbidden");
+  }
+});
+
+app.post("/webhook/whatsapp", async (req, res) => {
+  res.status(200).send("OK");
+  const body = req.body;
+  if (body.object !== "whatsapp_business_account") return;
+  try {
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        if (change.field !== "messages") continue;
+        const value = change.value;
+        for (const msg of value.messages || []) {
+          if (msg.type !== "text") continue;
+          const nr_telefone = msg.from;
+          const mensagemUsuario = msg.text?.body || "";
+          console.log("[WhatsApp] Mensagem recebida de", nr_telefone, ":", mensagemUsuario);
+
+          const respostaIA = await interpretarMensagem(mensagemUsuario);
+          console.log("[WhatsApp] Interpretação Gemini:", respostaIA);
+
+          const resultado = await executarAcao(respostaIA, nr_telefone);
+
+          if (resultado.error) {
+            console.log("[WhatsApp] Enviando resposta (erro):", resultado.error);
+            const envio = await enviarMensagem(nr_telefone, resultado.error);
+            if (!envio.ok) console.error("[WhatsApp] Falha ao enviar:", envio.error);
+            else console.log("[WhatsApp] Resposta enviada com sucesso.");
+            continue;
+          }
+          const texto = formatarResposta(resultado.acao, resultado.resultado);
+          console.log("[WhatsApp] Enviando resposta:", texto?.slice(0, 80) + (texto?.length > 80 ? "..." : ""));
+          const envio = await enviarMensagem(nr_telefone, texto);
+          if (!envio.ok) console.error("[WhatsApp] Falha ao enviar:", envio.error);
+          else console.log("[WhatsApp] Resposta enviada com sucesso.");
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Erro no webhook WhatsApp:", err);
+  }
+});
+
+// ---------------------- PROCESSAMENTO ----------------------
+// Recebe mensagem + nr_telefone, interpreta via Gemini, executa ação e retorna resultado
+app.post("/processar", async (req, res) => {
   const { mensagem, nr_telefone } = req.body;
 
   if (!mensagem || !nr_telefone) {
@@ -155,143 +215,19 @@ app.post("/processar", (req, res) => {
     });
   }
 
-  try {
-    const { acao, dados } = interpretar(mensagem);
+  const respostaIA = await interpretarMensagem(mensagem);
+  const resultado = await executarAcao(respostaIA, nr_telefone);
 
-    // Busca ou cria usuário pelo telefone
-    let usuario = db.prepare("SELECT * FROM USUARIO WHERE NR_TELEFONE = ?").get(nr_telefone);
-
-    if (!usuario && acao !== "CRIAR_USUARIO") {
-      return res.status(404).json({
-        error: "Usuário não encontrado. Qual nome voce quer ser chamado? (ex: Meu nome é João).",
-      });
-    }
-
-    let resultado = null;
-
-    switch (acao) {
-      case "CRIAR_USUARIO": {
-        const nm_usuario = dados.descricao || null;
-        if (!usuario) {
-          const stmt = db.prepare(
-            "INSERT INTO USUARIO (NR_TELEFONE, NM_USUARIO) VALUES (?, ?)"
-          );
-          const r = stmt.run(nr_telefone, nm_usuario);
-          usuario = {
-            ID_USUARIO: r.lastInsertRowid,
-            NR_TELEFONE: nr_telefone,
-            NM_USUARIO: nm_usuario,
-          };
-          resultado = { usuario, mensagem: "Usuário criado com sucesso." };
-        } else {
-          if (nm_usuario) {
-            db.prepare("UPDATE USUARIO SET NM_USUARIO = ? WHERE NR_TELEFONE = ?").run(nm_usuario, nr_telefone);
-            usuario.NM_USUARIO = nm_usuario;
-          }
-          resultado = { usuario, mensagem: "Nome atualizado com sucesso." };
-        }
-        break;
-      }
-
-      case "CRIAR_DESPESA": {
-        if (!dados.valor || !dados.data) {
-          return res.status(400).json({ error: "Não foi possível extrair valor ou data da mensagem." });
-        }
-        const stmt = db.prepare(
-          `INSERT INTO DESPESAS
-           (ID_USUARIO, TP_DESPESA, DS_DESPESA, VL_DESPESA, DT_DESPESA)
-           VALUES (?, ?, ?, ?, ?)`
-        );
-        const r = stmt.run(
-          usuario.ID_USUARIO,
-          dados.tipo || null,
-          dados.descricao || null,
-          dados.valor,
-          dados.data
-        );
-        resultado = {
-          id_despesa: r.lastInsertRowid,
-          despesa: {
-            ds_despesa: dados.descricao,
-            vl_despesa: dados.valor,
-            dt_despesa: dados.data,
-            tp_despesa: dados.tipo,
-          },
-          mensagem: `Despesa de R$ ${dados.valor} salva com sucesso.`,
-        };
-        break;
-      }
-
-      case "LISTAR_MENSAL": {
-        const [ano, mes] = dados.data ? dados.data.split("-") : [null, null];
-        if (!mes || !ano) {
-          return res.status(400).json({ error: "Não foi possível identificar mês/ano na mensagem." });
-        }
-        const despesas = db
-          .prepare(
-            `SELECT * FROM DESPESAS
-             WHERE ID_USUARIO = ? AND strftime('%m', DT_DESPESA) = ? AND strftime('%Y', DT_DESPESA) = ?`
-          )
-          .all(usuario.ID_USUARIO, String(mes).padStart(2, "0"), String(ano));
-        const total = despesas.reduce((s, d) => s + d.VL_DESPESA, 0);
-        resultado = { despesas, total, mes, ano };
-        break;
-      }
-
-      case "LISTAR_ANUAL": {
-        const ano = dados.data || new Date().getFullYear().toString();
-        const despesas = db
-          .prepare(
-            `SELECT * FROM DESPESAS
-             WHERE ID_USUARIO = ? AND strftime('%Y', DT_DESPESA) = ?`
-          )
-          .all(usuario.ID_USUARIO, String(ano));
-        const total = despesas.reduce((s, d) => s + d.VL_DESPESA, 0);
-        resultado = { despesas, total, ano };
-        break;
-      }
-
-      case "REMOVER_DESPESA": {
-        const descricao = dados.descricao;
-        if (!descricao) {
-          return res.status(400).json({ error: "Não foi possível identificar qual despesa remover." });
-        }
-        const despesa = db
-          .prepare(
-            `SELECT * FROM DESPESAS
-             WHERE ID_USUARIO = ? AND (DS_DESPESA = ? OR DS_DESPESA LIKE ?)
-             ORDER BY DT_DESPESA DESC LIMIT 1`
-          )
-          .get(usuario.ID_USUARIO, descricao, `%${descricao}%`);
-        if (!despesa) {
-          return res.status(404).json({ error: `Nenhuma despesa encontrada com a descrição "${descricao}".` });
-        }
-        db.prepare("DELETE FROM DESPESAS WHERE ID_DESPESA = ?").run(despesa.ID_DESPESA);
-        resultado = { mensagem: "Despesa removida com sucesso.", despesa_removida: despesa };
-        break;
-      }
-
-      case "DESCONHECIDO":
-      default:
-        resultado = {
-          mensagem: "Não entendi sua mensagem. Tente: adicionar despesa, ver gastos do mês/ano ou informar seu nome.",
-        };
-        break;
-    }
-
-    res.json({ acao, resultado });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      error: "Erro ao processar mensagem.",
-      detalhe: err.message,
-    });
+  if (resultado.error) {
+    return res.status(400).json({ error: resultado.error });
   }
+
+  res.json({ acao: resultado.acao, resultado: resultado.resultado });
 });
 
-// ---------------------- INTERPRETAÇÃO DE MENSAGENS ----------------------
-// Recebe mensagem (ex: do WhatsApp), simula LLM e retorna acao + dados (sem executar)
-app.post("/interpretar", (req, res) => {
+
+// ---------------------- INTERPRETAÇÃO DE MENSAGENS (GEMINI) ----------------------
+app.post("/interpretar", async (req, res) => {
   const { mensagem } = req.body;
 
   if (!mensagem) {
@@ -299,14 +235,11 @@ app.post("/interpretar", (req, res) => {
   }
 
   try {
-    const resultado = interpretar(mensagem);
+    const resultado = await interpretarMensagem(mensagem);
     res.json(resultado);
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      acao: "DESCONHECIDO",
-      dados: { descricao: null, valor: null, data: null, tipo: null },
-    });
+    res.status(500).json({ acao: "DESCONHECIDO" });
   }
 });
 
