@@ -16,8 +16,9 @@ async function executarAcao(respostaIA, nr_telefone) {
       };
     }
     const hoje = new Date().toISOString().slice(0, 10);
+    const inclusao = new Date().toISOString();
     const stmt = db.prepare(
-      `INSERT INTO DESPESAS (ID_USUARIO, TP_DESPESA, DS_DESPESA, VL_DESPESA, DT_DESPESA) VALUES (?, ?, ?, ?, ?)`
+      `INSERT INTO DESPESAS (ID_USUARIO, TP_DESPESA, DS_DESPESA, VL_DESPESA, DT_DESPESA, DT_INCLUSAO) VALUES (?, ?, ?, ?, ?, ?)`
     );
     const criadas = [];
     for (const d of listaDespesas) {
@@ -25,7 +26,7 @@ async function executarAcao(respostaIA, nr_telefone) {
         const valor = Number(d.valor);
         const categoria = d.categoria || null;
         if (valor > 0) {
-          stmt.run(usuario.ID_USUARIO, categoria, categoria, valor, hoje);
+          stmt.run(usuario.ID_USUARIO, categoria, categoria, valor, hoje, inclusao);
           criadas.push(`R$ ${valor} (${categoria || "geral"})`);
         }
       }
@@ -54,10 +55,11 @@ async function executarAcao(respostaIA, nr_telefone) {
           return { error: "Não consegui identificar o valor. Ex: 50 mercado" };
         }
         const hoje = new Date().toISOString().slice(0, 10);
+        const inclusao = new Date().toISOString();
         const stmt = db.prepare(
-          `INSERT INTO DESPESAS (ID_USUARIO, TP_DESPESA, DS_DESPESA, VL_DESPESA, DT_DESPESA) VALUES (?, ?, ?, ?, ?)`
+          `INSERT INTO DESPESAS (ID_USUARIO, TP_DESPESA, DS_DESPESA, VL_DESPESA, DT_DESPESA, DT_INCLUSAO) VALUES (?, ?, ?, ?, ?, ?)`
         );
-        stmt.run(usuario.ID_USUARIO, categoria, categoria, valor, hoje);
+        stmt.run(usuario.ID_USUARIO, categoria, categoria, valor, hoje, inclusao);
         return {
           acao: "CRIAR_DESPESA",
           resultado: { mensagem: `Despesa de R$ ${valor} (${categoria || "geral"}) salva com sucesso.` },
@@ -108,6 +110,32 @@ async function executarAcao(respostaIA, nr_telefone) {
         return {
           acao: "CRIAR_USUARIO",
           resultado: { mensagem: nm_usuario ? `Nome atualizado para ${nm_usuario}.` : "Nome atualizado." },
+        };
+      }
+
+      case "ATUALIZAR_RENDA_MENSAL": {
+        const valor = Number(respostaIA.valor);
+        if (!valor || valor <= 0) {
+          return { error: "Não consegui identificar o valor da renda mensal." };
+        }
+
+        db.prepare("UPDATE USUARIO SET VL_RENDA_MENSAL = ? WHERE ID_USUARIO = ?").run(valor, usuario.ID_USUARIO);
+        return {
+          acao: "ATUALIZAR_RENDA_MENSAL",
+          resultado: { mensagem: `Renda mensal atualizada para R$ ${valor}.` },
+        };
+      }
+
+      case "ATUALIZAR_DIA_RECEBIMENTO": {
+        const dia = Number(respostaIA.dia);
+        if (!dia || dia < 1 || dia > 31) {
+          return { error: "Não consegui identificar um dia de recebimento válido (1 a 31)." };
+        }
+
+        db.prepare("UPDATE USUARIO SET NR_DIA_RECEBIMENTO = ? WHERE ID_USUARIO = ?").run(dia, usuario.ID_USUARIO);
+        return {
+          acao: "ATUALIZAR_DIA_RECEBIMENTO",
+          resultado: { mensagem: `Dia de recebimento atualizado para dia ${dia}.` },
         };
       }
 

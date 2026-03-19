@@ -8,6 +8,12 @@ function formatarResposta(acao, resultado) {
     case "CRIAR_DESPESA":
       return resultado.mensagem;
 
+    case "ATUALIZAR_RENDA_MENSAL":
+      return resultado.mensagem;
+
+    case "ATUALIZAR_DIA_RECEBIMENTO":
+      return resultado.mensagem;
+
     case "LISTAR_MENSAL": {
       const { despesas, total, mes, ano } = resultado;
       if (!despesas || despesas.length === 0) {

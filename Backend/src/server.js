@@ -18,28 +18,76 @@ app.get("/", (req, res) => {
 
 // Cria usuário (NR_TELEFONE é o identificador principal vindo do WhatsApp)
 app.post("/usuarios", (req, res) => {
-  const { nr_telefone, nm_usuario } = req.body;
+  const { nr_telefone, nm_usuario, vl_renda_mensal, nr_dia_recebimento, ds_objetivo } = req.body;
 
   if (!nr_telefone) {
     return res.status(400).json({ error: "número do telefone é obrigatório." });
   }
 
+  const vlRendaMensalParsed =
+    vl_renda_mensal == null || vl_renda_mensal === ''
+      ? null
+      : Number(vl_renda_mensal);
+  const vlRendaMensal = Number.isFinite(vlRendaMensalParsed) ? vlRendaMensalParsed : null;
+
+  const nrDiaRecebimentoParsed =
+    nr_dia_recebimento == null || nr_dia_recebimento === ''
+      ? null
+      : Number(nr_dia_recebimento);
+  const nrDiaRecebimento = Number.isFinite(nrDiaRecebimentoParsed) ? nrDiaRecebimentoParsed : null;
+
+  const dsObjetivoParsed =
+    typeof ds_objetivo === "string" && ds_objetivo.trim()
+      ? ds_objetivo.trim()
+      : null;
+
   try {
     const stmt = db.prepare(
-      "INSERT INTO USUARIO (NR_TELEFONE, NM_USUARIO) VALUES (?, ?)"
+      "INSERT INTO USUARIO (NR_TELEFONE, NM_USUARIO, VL_RENDA_MENSAL, NR_DIA_RECEBIMENTO, DS_OBJETIVO) VALUES (?, ?, ?, ?, ?)"
     );
-    const result = stmt.run(nr_telefone, nm_usuario || null);
+    const result = stmt.run(
+      nr_telefone,
+      nm_usuario || null,
+      vlRendaMensal,
+      nrDiaRecebimento,
+      dsObjetivoParsed
+    );
 
     res.status(201).json({
       id_usuario: result.lastInsertRowid,
       nr_telefone,
       nm_usuario: nm_usuario || null,
+      vl_renda_mensal: vlRendaMensal,
+      nr_dia_recebimento: nrDiaRecebimento,
+      ds_objetivo: dsObjetivoParsed,
     });
   } catch (err) {
     if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-      return res
-        .status(409)
-        .json({ error: "Já existe um usuário com esse telefone." });
+      // Se já existir, atualiza os dados (em vez de forçar o client a lidar com 409).
+      const updated = db
+        .prepare(
+          `UPDATE USUARIO
+           SET NM_USUARIO = COALESCE(?, NM_USUARIO),
+               VL_RENDA_MENSAL = COALESCE(?, VL_RENDA_MENSAL),
+               NR_DIA_RECEBIMENTO = COALESCE(?, NR_DIA_RECEBIMENTO),
+               DS_OBJETIVO = COALESCE(?, DS_OBJETIVO)
+           WHERE NR_TELEFONE = ?`
+        )
+        .run(nm_usuario || null, vlRendaMensal, nrDiaRecebimento, dsObjetivoParsed, nr_telefone);
+
+      const row = db.prepare("SELECT * FROM USUARIO WHERE NR_TELEFONE = ?").get(nr_telefone);
+      if (!row) {
+        return res.status(500).json({ error: "Falha ao recuperar usuário existente após update." });
+      }
+
+      return res.status(200).json({
+        id_usuario: row.ID_USUARIO,
+        nr_telefone: row.NR_TELEFONE,
+        nm_usuario: row.NM_USUARIO,
+        vl_renda_mensal: row.VL_RENDA_MENSAL,
+        nr_dia_recebimento: row.NR_DIA_RECEBIMENTO,
+        ds_objetivo: row.DS_OBJETIVO,
+      });
     }
     console.error(err);
     res.status(500).json({ error: "Erro ao criar usuário." });
@@ -54,6 +102,19 @@ app.get("/usuarios", (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Erro ao listar usuários." });
+  }
+});
+
+// Busca usuário por ID (usado pelo Dashboard web)
+app.get("/usuarios/:id_usuario", (req, res) => {
+  const { id_usuario } = req.params;
+  try {
+    const row = db.prepare("SELECT * FROM USUARIO WHERE ID_USUARIO = ?").get(id_usuario);
+    if (!row) return res.status(404).json({ error: "Usuário não encontrado." });
+    res.json(row);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro ao buscar usuário." });
   }
 });
 
@@ -73,16 +134,18 @@ app.post("/despesas", (req, res) => {
   try {
     const stmt = db.prepare(
       `INSERT INTO DESPESAS
-       (ID_USUARIO, TP_DESPESA, DS_DESPESA, VL_DESPESA, DT_DESPESA)
-       VALUES (?, ?, ?, ?, ?)`
+       (ID_USUARIO, TP_DESPESA, DS_DESPESA, VL_DESPESA, DT_DESPESA, DT_INCLUSAO)
+       VALUES (?, ?, ?, ?, ?, ?)`
     );
 
+    const dtInclusao = new Date().toISOString();
     const result = stmt.run(
       id_usuario,
       tp_despesa || null,
       ds_despesa || null,
       vl_despesa,
-      dt_despesa
+      dt_despesa,
+      dtInclusao
     );
 
     res.status(201).json({
@@ -92,6 +155,7 @@ app.post("/despesas", (req, res) => {
       ds_despesa: ds_despesa || null,
       vl_despesa,
       dt_despesa,
+      dt_inclusao: dtInclusao,
     });
   } catch (err) {
     console.error(err);
@@ -126,6 +190,31 @@ app.get("/despesas", (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Erro ao listar despesas." });
+  }
+});
+
+// Lista despesas por intervalo (período baseado no dia de recebimento)
+app.get("/despesas/periodo", (req, res) => {
+  const { id_usuario, inicio, fim } = req.query;
+
+  if (!id_usuario || !inicio || !fim) {
+    return res.status(400).json({ error: "id_usuario, inicio e fim são obrigatórios." });
+  }
+
+  try {
+    const stmt = db.prepare(
+      `SELECT *
+       FROM DESPESAS
+       WHERE ID_USUARIO = ?
+         AND DT_INCLUSAO >= ?
+         AND DT_INCLUSAO <= ?
+       ORDER BY DT_INCLUSAO DESC`
+    );
+    const despesas = stmt.all(id_usuario, inicio, fim);
+    res.json(despesas);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro ao listar despesas por período." });
   }
 });
 
