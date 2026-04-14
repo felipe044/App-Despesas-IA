@@ -5,6 +5,9 @@ const { interpretarMensagem } = require("./geminiService");
 const { executarAcao } = require("./acoesGemini");
 const { formatarResposta } = require("./formatarResposta");
 const { enviarMensagem } = require("./whatsapp");
+const { processarWebhookHotmart, verificarHottok } = require("./hotmartWebhook");
+const { classificarAcessoPlataforma } = require("./usuarioGate");
+const { buildMensagemBloqueioWhatsApp } = require("./assinaturaConfig");
 
 const app = express();
 app.use(express.json());
@@ -238,6 +241,9 @@ app.delete("/despesas/:id", (req, res) => {
 });
 
 // ---------------------- WEBHOOK WHATSAPP ----------------------
+// Fluxo de cada mensagem: normaliza o telefone → SQL em USUARIO (ver usuarioGate.js) →
+// se não existir ou TP_SITUACAO ≠ ATIVO, envia buildMensagemBloqueioWhatsApp e NÃO chama Gemini.
+// Se ATIVO, interpretarMensagem + executarAcao.
 const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "despesas-verify-token";
 
 // Resposta rápida para o Meta validar (evita timeouts)
@@ -262,11 +268,30 @@ app.post("/webhook/whatsapp", async (req, res) => {
       for (const change of entry.changes || []) {
         if (change.field !== "messages") continue;
         const value = change.value;
+        const businessDigits = String(value.metadata?.display_phone_number || "").replace(/\D/g, "");
         for (const msg of value.messages || []) {
-          if (msg.type !== "text") continue;
           const nr_telefone = msg.from;
-          const mensagemUsuario = msg.text?.body || "";
-          console.log("[WhatsApp] Mensagem recebida de", nr_telefone, ":", mensagemUsuario);
+          const fromDigits = String(nr_telefone || "").replace(/\D/g, "");
+          if (businessDigits && fromDigits === businessDigits) {
+            console.log("[WhatsApp] Ignorando webhook com from = número comercial (eco/outbound).");
+            continue;
+          }
+
+          const mensagemUsuario = msg.type === "text" ? msg.text?.body || "" : "";
+          console.log("[WhatsApp] Mensagem recebida de", nr_telefone, "tipo", msg.type, ":", mensagemUsuario);
+
+          const gate = classificarAcessoPlataforma(nr_telefone);
+          if (!gate.ativo) {
+            console.log("[WhatsApp] BLOQUEIO (SQL USUARIO):", gate.razao, "| from=", nr_telefone);
+            const textoBloqueio = buildMensagemBloqueioWhatsApp(gate.razao);
+            const envio = await enviarMensagem(nr_telefone, textoBloqueio);
+            if (!envio.ok) console.error("[WhatsApp] Falha ao enviar aviso de assinatura:", envio.error);
+            continue;
+          }
+
+          console.log("[WhatsApp] OK — usuário ATIVO na base, seguindo para Gemini.");
+
+          if (msg.type !== "text") continue;
 
           const respostaIA = await interpretarMensagem(mensagemUsuario);
           console.log("[WhatsApp] Interpretação Gemini:", respostaIA);
@@ -293,6 +318,28 @@ app.post("/webhook/whatsapp", async (req, res) => {
   }
 });
 
+// ---------------------- WEBHOOK HOTMART (assinaturas) ----------------------
+// URL para colar na Hotmart: https://SEU_DOMINIO/webhook/hotmart  (HTTPS)
+app.get("/webhook/hotmart", (req, res) => {
+  // Evita 304 no navegador (cache) ao testar a URL — ngrok passa a mostrar 200.
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.status(200).type("text/plain").send("ok");
+});
+
+app.post("/webhook/hotmart", async (req, res) => {
+  if (!verificarHottok(req)) {
+    console.error("[Hotmart] 403 — X-HOTMART-HOTTOK não bate com HOTMART_HOTTOK do .env (webhook rejeitado, nada gravado).");
+    return res.status(403).json({ error: "hottok inválido" });
+  }
+  try {
+    await processarWebhookHotmart(req.body);
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error("[Hotmart] Erro ao processar webhook:", err);
+    res.status(500).json({ error: "erro interno" });
+  }
+});
+
 // ---------------------- PROCESSAMENTO ----------------------
 // Recebe mensagem + nr_telefone, interpreta via Gemini, executa ação e retorna resultado
 app.post("/processar", async (req, res) => {
@@ -302,6 +349,12 @@ app.post("/processar", async (req, res) => {
     return res.status(400).json({
       error: "Informe o número de telefone e a mensagem para prosseguir.",
     });
+  }
+
+  const gateProc = classificarAcessoPlataforma(nr_telefone);
+  if (!gateProc.ativo) {
+    const txt = buildMensagemBloqueioWhatsApp(gateProc.razao);
+    return res.status(403).json({ error: txt.replace(/\*/g, "") });
   }
 
   const respostaIA = await interpretarMensagem(mensagem);

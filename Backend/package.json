@@ -5,7 +5,12 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "nodemon src/server.js"
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "reset:usuarios": "node scripts/resetUsuarios.js",
+    "db:inspect": "node scripts/inspectDb.js",
+    "db:sql": "node scripts/runSql.js",
+    "db:ensure-assinatura": "node scripts/ensureAssinaturaTable.js"
   },
   "keywords": [],
   "author": "",

@@ -1,19 +1,31 @@
 const db = require("./db");
+const { classificarAcessoPlataforma, buscarUsuarioPorTelefone } = require("./usuarioGate");
+const { buildMensagemBloqueioWhatsApp } = require("./assinaturaConfig");
+
+function erroSeNaoAtivo(nrRaw) {
+  const gate = classificarAcessoPlataforma(nrRaw);
+  if (gate.ativo) return null;
+  return buildMensagemBloqueioWhatsApp(gate.razao);
+}
 
 async function executarAcao(respostaIA, nr_telefone) {
   if (!respostaIA || !nr_telefone) {
     return { error: "Informe o número do telefone e a resposta da IA para prosseguir." };
   }
 
+  const bloqueio = erroSeNaoAtivo(nr_telefone);
+  if (bloqueio) return { error: bloqueio };
+
+  const { nr: nrNorm, row: usuario } = buscarUsuarioPorTelefone(nr_telefone);
   const acao = respostaIA.acao || "DESCONHECIDO";
-  let usuario = db.prepare("SELECT * FROM USUARIO WHERE NR_TELEFONE = ?").get(nr_telefone);
+  if (!nrNorm) {
+    return { error: buildMensagemBloqueioWhatsApp("SEM_TELEFONE") };
+  }
 
   const listaDespesas = Array.isArray(respostaIA.despesas) ? respostaIA.despesas : [];
   if (listaDespesas.length > 0) {
     if (!usuario) {
-      return {
-        error: "Olá! Para começar, me diga como posso te chamar. Exemplo: Meu nome é João",
-      };
+      return { error: buildMensagemBloqueioWhatsApp("SEM_USUARIO") };
     }
     const hoje = new Date().toISOString().slice(0, 10);
     const inclusao = new Date().toISOString();
@@ -41,9 +53,7 @@ async function executarAcao(respostaIA, nr_telefone) {
   }
 
   if (!usuario && acao !== "CRIAR_USUARIO") {
-    return {
-      error: "Olá! Para começar, me diga como posso te chamar. Exemplo: Meu nome é João",
-    };
+    return { error: buildMensagemBloqueioWhatsApp("SEM_USUARIO") };
   }
 
   try {
@@ -97,15 +107,10 @@ async function executarAcao(respostaIA, nr_telefone) {
       case "CRIAR_USUARIO": {
         const nm_usuario = respostaIA.nome || null;
         if (!usuario) {
-          const stmt = db.prepare("INSERT INTO USUARIO (NR_TELEFONE, NM_USUARIO) VALUES (?, ?)");
-          stmt.run(nr_telefone, nm_usuario);
-          return {
-            acao: "CRIAR_USUARIO",
-            resultado: { mensagem: nm_usuario ? `Olá, ${nm_usuario}! Usuário criado com sucesso.` : "Usuário criado com sucesso." },
-          };
+          return { error: buildMensagemBloqueioWhatsApp("SEM_USUARIO") };
         }
         if (nm_usuario) {
-          db.prepare("UPDATE USUARIO SET NM_USUARIO = ? WHERE NR_TELEFONE = ?").run(nm_usuario, nr_telefone);
+          db.prepare("UPDATE USUARIO SET NM_USUARIO = ? WHERE NR_TELEFONE = ?").run(nm_usuario, nrNorm);
         }
         return {
           acao: "CRIAR_USUARIO",
@@ -145,7 +150,8 @@ async function executarAcao(respostaIA, nr_telefone) {
         return {
           acao: "DESCONHECIDO",
           resultado: {
-            mensagem: "Não entendi. Tente: adicionar despesa (ex: 50 mercado), ver gastos (ex: quanto gastei esse mês), ou dizer seu nome (ex: meu nome é Maria).",
+            mensagem:
+              "Não entendi. Tente: adicionar despesa (ex: 50 mercado), ver gastos (ex: quanto gastei esse mês) ou atualizar seu nome (ex: meu nome é Maria).",
           },
         };
     }

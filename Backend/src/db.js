@@ -1,7 +1,9 @@
+const path = require("path");
 const Database = require("better-sqlite3");
 
-// Abre (ou cria) o arquivo de banco de dados
-const db = new Database("despesas.db");
+// Sempre o mesmo ficheiro (pasta Backend), independentemente do cwd do `node`
+const dbPath = path.join(__dirname, "..", "despesas.db");
+const db = new Database(dbPath);
 
 // Cria as tabelas se ainda não existirem
 db.exec(`
@@ -9,6 +11,7 @@ db.exec(`
     ID_USUARIO   INTEGER PRIMARY KEY AUTOINCREMENT,
     NR_TELEFONE  TEXT NOT NULL UNIQUE,
     NM_USUARIO   TEXT,
+    TP_SITUACAO  TEXT NOT NULL DEFAULT 'INATIVO',
     VL_RENDA_MENSAL REAL,
     NR_DIA_RECEBIMENTO INTEGER,
     DS_OBJETIVO TEXT
@@ -24,6 +27,21 @@ db.exec(`
     DT_INCLUSAO  TEXT NOT NULL,
     FOREIGN KEY (ID_USUARIO) REFERENCES USUARIO(ID_USUARIO)
   );
+
+  CREATE TABLE IF NOT EXISTS ASSINATURA_HOTMART (
+    CD_SUBSCRICAO   TEXT PRIMARY KEY,
+    NR_TELEFONE     TEXT NOT NULL,
+    ST_ATIVA        INTEGER NOT NULL DEFAULT 1,
+    DT_VALIDADE_ATE TEXT,
+    DT_ATUALIZACAO  TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_assinatura_hotmart_telefone ON ASSINATURA_HOTMART(NR_TELEFONE);
+
+  CREATE TABLE IF NOT EXISTS WHATSAPP_BOAS_VINDAS (
+    NR_TELEFONE TEXT PRIMARY KEY,
+    DT_ENVIO    TEXT NOT NULL
+  );
 `);
 
 // Migra colunas caso o banco já exista com um schema antigo.
@@ -37,6 +55,22 @@ const ensureColumn = (columnName, ddl) => {
 ensureColumn("VL_RENDA_MENSAL", "VL_RENDA_MENSAL REAL");
 ensureColumn("NR_DIA_RECEBIMENTO", "NR_DIA_RECEBIMENTO INTEGER");
 ensureColumn("DS_OBJETIVO", "DS_OBJETIVO TEXT");
+ensureColumn("TP_SITUACAO", "TP_SITUACAO TEXT NOT NULL DEFAULT 'INATIVO'");
+
+// Migração: situação passa a refletir assinatura Hotmart já gravada
+try {
+  db.exec(`
+    UPDATE USUARIO SET TP_SITUACAO = 'ATIVO'
+    WHERE UPPER(TRIM(COALESCE(TP_SITUACAO, ''))) != 'ATIVO'
+      AND NR_TELEFONE IN (
+        SELECT NR_TELEFONE FROM ASSINATURA_HOTMART
+        WHERE ST_ATIVA = 1
+          AND (DT_VALIDADE_ATE IS NULL OR datetime(DT_VALIDADE_ATE) >= datetime('now'))
+      );
+  `);
+} catch (_) {
+  /* ASSINATURA_HOTMART pode não existir em bases muito antigas */
+}
 
 const despesaColumns = db.prepare("PRAGMA table_info(DESPESAS)").all().map((r) => r.name);
 if (!despesaColumns.includes("DT_INCLUSAO")) {
